@@ -3,6 +3,7 @@ package stacks
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
@@ -10,12 +11,6 @@ import (
 
 	"github.com/soypat/seqs/eth"
 	"github.com/soypat/seqs/eth/dhcp"
-)
-
-var (
-	errUnhandledState = errors.New("unhandled state")
-	errBadMagicCookie = errors.New("bad magic cookie")
-	errUnexpectedXid  = errors.New("unexpected xid")
 )
 
 type DHCPClient struct {
@@ -30,7 +25,6 @@ type DHCPClient struct {
 	port        uint16
 	aborted     bool
 	aux         UDPPacket // Avoid heap allocation.
-	optionbuf   [4]dhcp.Option
 }
 
 // State transition table:
@@ -88,13 +82,14 @@ func (d *DHCPClient) Offer() netip.Addr {
 }
 
 func (d *DHCPClient) ourHeader() dhcp.HeaderV4 {
+	ciAddr, _ := d.stack.Addr()
 	hdr := dhcp.HeaderV4{
 		OP:     dhcp.OpRequest,
 		Xid:    d.currentXid,
 		HType:  1,
 		HLen:   6,
 		HOps:   0,
-		CIAddr: d.stack.Addr().As4(),
+		CIAddr: ciAddr.As4(),
 		SIAddr: d.svip,
 		YIAddr: d.offer,
 	}
@@ -105,8 +100,6 @@ func (d *DHCPClient) ourHeader() dhcp.HeaderV4 {
 
 func (d *DHCPClient) isAborted() bool { return d.currentXid == 0 || d.aborted }
 
-var dhcpDefaultParamReqList = []byte{1, 3, 15, 6}
-
 func (d *DHCPClient) send(dst []byte) (n int, err error) {
 	if !d.isPendingHandling() {
 		return 0, io.EOF // Signal to close socket.
@@ -114,39 +107,36 @@ func (d *DHCPClient) send(dst []byte) (n int, err error) {
 	const dhcpOffset = eth.SizeEthernetHeader + eth.SizeIPv4Header + eth.SizeUDPHeader
 	switch {
 	case len(dst) < dhcpOffset+dhcp.SizeDatagram:
-		return 0, io.ErrShortBuffer
+		return 0, errors.New("short payload to marshall DHCP")
 	}
 
 	// Switch statement prepares DHCP response depending on whether we're waiting
 	// for offer, ack or if we still need to send a discover (StateNone).
 	var Options []dhcp.Option
 	var nextstate uint8
-	var optByte [1]byte
 	switch d.state { // Send.
 	case dhcpStateNone:
 		// DHCP options.
-		optByte[0] = byte(dhcp.MsgDiscover)
-		Options = append(d.optionbuf[:0], []dhcp.Option{
-			{Num: dhcp.OptMessageType, Data: optByte[:]},
-			{Num: dhcp.OptParameterRequestList, Data: dhcpDefaultParamReqList},
-		}...)
+		Options = []dhcp.Option{
+			{Num: dhcp.OptMessageType, Data: []byte{byte(dhcp.MsgDiscover)}},
+			{Num: dhcp.OptParameterRequestList, Data: []byte{1, 3, 15, 6}},
+		}
 		if d.requestedIP != [4]byte{} {
 			Options = append(Options, dhcp.Option{Num: dhcp.OptRequestedIPaddress, Data: d.requestedIP[:]})
 		}
 		nextstate = dhcpStateWaitOffer
 
 	case dhcpStateGotOffer:
-		optByte[0] = byte(dhcp.MsgRequest)
 		// Accept this server's offer.
-		Options = append(d.optionbuf[:0], []dhcp.Option{
-			{Num: dhcp.OptMessageType, Data: optByte[:]},
+		Options = []dhcp.Option{
+			{Num: dhcp.OptMessageType, Data: []byte{byte(dhcp.MsgRequest)}},
 			{Num: dhcp.OptRequestedIPaddress, Data: d.offer[:]},
 			{Num: dhcp.OptServerIdentification, Data: d.svip[:]},
-		}...)
+		}
 		nextstate = dhcpStateWaitAck
 
 	default:
-		err = errUnhandledState
+		err = fmt.Errorf("UNHANDLED CASE %v", d.state)
 	}
 	if err != nil {
 		return 0, nil
@@ -177,9 +167,7 @@ func (d *DHCPClient) send(dst []byte) (n int, err error) {
 	d.setResponseUDP(pkt, payload)
 	pkt.PutHeaders(dst)
 	d.state = nextstate
-	if d.stack.isLogEnabled(slog.LevelInfo) {
-		d.stack.info("DHCP:tx", slog.String("msg", dhcp.MessageType(Options[0].Data[0]).String()))
-	}
+	d.stack.info("DHCP:tx", slog.String("msg", dhcp.MessageType(Options[0].Data[0]).String()))
 	return dhcpOffset + dhcp.SizeDatagram, nil
 }
 
@@ -187,24 +175,25 @@ func (d *DHCPClient) recv(pkt *UDPPacket) (err error) {
 	if !d.isPendingHandling() {
 		return io.EOF // Signal to close socket.
 	}
+
 	incpayload := pkt.Payload()
 	if len(incpayload) < dhcp.SizeHeader {
-		return io.ErrShortBuffer
+		return errors.New("short payload to parse DHCP")
 	}
 
 	rcvHdr := dhcp.DecodeHeaderV4(incpayload)
 	if rcvHdr.Xid != d.currentXid {
-		return errUnexpectedXid
+		return errors.New("dhcp-rx: unexpected xid")
 	}
 
 	cookie := binary.BigEndian.Uint32(incpayload[dhcp.MagicCookieOffset:])
 	if cookie != dhcp.MagicCookie {
-		return errBadMagicCookie
+		return errors.New("dhcp-rx: bad magic cookie")
 	}
 
 	// Parse DHCP options looking for message type field.
 	var msgType dhcp.MessageType
-	debugEnabled := d.stack.isLogEnabled(slog.LevelDebug)
+	debugm1Enabled := d.stack.isLogEnabled(slog.LevelDebug)
 	err = dhcp.ForEachOption(incpayload, func(opt dhcp.Option) error {
 		switch opt.Num {
 		case dhcp.OptMessageType:
@@ -212,14 +201,13 @@ func (d *DHCPClient) recv(pkt *UDPPacket) (err error) {
 				msgType = dhcp.MessageType(opt.Data[0])
 			}
 		}
-		if debugEnabled {
+		if debugm1Enabled {
 			d.stack.debug("DHCP:rx", slog.String("opt", opt.Num.String()), slog.String("data", stringNumList(opt.Data)))
 		}
 		return nil
 	})
-	if d.stack.isLogEnabled(slog.LevelInfo) {
-		d.stack.info("DHCP:rx", slog.String("msg", msgType.String()))
-	}
+
+	d.stack.info("DHCP:rx", slog.String("msg", msgType.String()))
 	switch d.state { // Receive.
 	case dhcpStateWaitOffer:
 		// Accept this server's offer.
@@ -233,7 +221,7 @@ func (d *DHCPClient) recv(pkt *UDPPacket) (err error) {
 	case dhcpStateDone:
 		err = io.EOF // We got a valid response, close socket.
 	default:
-		err = errUnhandledState
+		err = errors.New("unhandled dhcp-rx case: " + strconv.Itoa(int(d.state)))
 	}
 	if err != nil {
 		return err
